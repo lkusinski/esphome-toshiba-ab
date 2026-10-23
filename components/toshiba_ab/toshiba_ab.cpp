@@ -4464,7 +4464,17 @@ void ToshibaAbClimate::process_received_data_estia_first_gen_(const DataFrame *f
   this->decode_estia_first_gen_dn_(frame);
   if (has_master_keepalive_signature && is_possible_master_source)
     this->record_discovered_address_(src, false);
-  if (has_remote_ping_signature && is_remote_source) this->record_discovered_address_(src, true);
+  if (has_remote_ping_signature && is_remote_source) {
+    this->record_discovered_address_(src, true);
+    // First-generation wall remotes report their room temperature in a PING.
+    if (len >= 11 && frame->raw[6] == 0x81 && this->remote_room_temp_sensor_ != nullptr) {
+      const uint8_t encoded_temperature = frame->raw[9];
+      if (encoded_temperature != 0) {
+        this->remote_room_temp_sensor_->publish_state(
+            static_cast<float>(encoded_temperature) / 2.0f - 16.0f);
+      }
+    }
+  }
   if (has_master_keepalive_signature && is_possible_master_source) {
     if (this->master_address_auto_ && !this->master_address_confirmed_ && src != this->master_address_) {
       ESP_LOGI(TAG, "Estia first-gen master keepalive from 0x%02X; switching master address from 0x%02X",
@@ -4525,6 +4535,8 @@ void ToshibaAbClimate::process_received_data_estia_first_gen_(const DataFrame *f
       this->hotwater_pump_heating_binary_sensor_->publish_state(this->estia_first_gen_hotwater_pump_heating_);
     if (this->hotwater_resistor_heating_binary_sensor_)
       this->hotwater_resistor_heating_binary_sensor_->publish_state(this->estia_first_gen_hotwater_resistor_heating_);
+    if (this->silent_mode_hardware_binary_sensor_)
+      this->silent_mode_hardware_binary_sensor_->publish_state((frame->raw[7] & 0x20) != 0);
     if (this->zone1_target_temperature_sensor_) this->zone1_target_temperature_sensor_->publish_state(static_cast<float>(frame->raw[10]) / 2.0f - 16.0f);
     const bool has_status_temperatures = frame->raw[0] == 0x15 && len > 18;
     // Zero means no DHW sensor on heating-only systems, not -16 degrees.
