@@ -1444,8 +1444,16 @@ void ToshibaAbEstiaCurveShiftSelect::control(const std::string &value) {
 climate::ClimateTraits ToshibaAbEstiaZoneClimate::traits() {
   climate::ClimateTraits traits;
   traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
-  traits.set_supported_modes(
-      {climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_HEAT, climate::CLIMATE_MODE_COOL, climate::CLIMATE_MODE_AUTO});
+  if (this->parent_->is_estia_first_gen()) {
+    // First-generation Estia is heating-only; exposing COOL lets HA (or a
+    // restored frontend state) put the hydrobox into a mode from which the
+    // follower remote cannot return to HEAT.
+    traits.set_supported_modes(
+        {climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_HEAT, climate::CLIMATE_MODE_AUTO});
+  } else {
+    traits.set_supported_modes(
+        {climate::CLIMATE_MODE_OFF, climate::CLIMATE_MODE_HEAT, climate::CLIMATE_MODE_COOL, climate::CLIMATE_MODE_AUTO});
+  }
   if (this->parent_->is_estia_r32()) {
     traits.set_supported_presets({climate::CLIMATE_PRESET_NONE});
     detail::configure_night_setback(*this, traits, 0);
@@ -3450,6 +3458,8 @@ void ToshibaAbClimate::control(const climate::ClimateCall &call) {
   }
 }
 
+static DataFrame make_estia_first_gen_frame(uint8_t src, uint8_t dst, const uint8_t *payload, size_t payload_len);
+
 void ToshibaAbClimate::control_estia_zone1(const climate::ClimateCall &call) {
   if (this->read_only_) {
     ESP_LOGW(TAG, "Read-only mode: not controlling Estia Zone 1 thermostat");
@@ -3465,9 +3475,19 @@ void ToshibaAbClimate::control_estia_zone1(const climate::ClimateCall &call) {
         this->send_estia_first_gen_zone1(false);
       } else if (requested_mode == climate::CLIMATE_MODE_AUTO || requested_mode == climate::CLIMATE_MODE_HEAT ||
                  requested_mode == climate::CLIMATE_MODE_COOL) {
-        if (this->estia_first_gen_zone1_active_) {
-          this->send_estia_first_gen_zone1_mode(requested_mode);
+        // Captured from the HWS-AMS54: pressing ON in HEAT sends 0x22:02:02
+        // first, then Zone 1 ON (0x21:03). 0x22:06:06 is the later mode frame
+        // and does NOT recover the hydrobox from a previous OFF/COOL state.
+        if (!this->estia_first_gen_zone1_active_ && requested_mode == climate::CLIMATE_MODE_HEAT) {
+          const uint8_t power_on_payload[] = {0xE0, 0x01, 0x22, 0x02, 0x02};
+          this->send_command(make_estia_first_gen_frame(this->remote_address_, this->master_address_,
+                                                        power_on_payload, sizeof(power_on_payload)));
+          this->send_estia_first_gen_zone1(true);
+        } else if (this->estia_first_gen_zone1_active_) {
+          if (requested_mode != climate::CLIMATE_MODE_HEAT)
+            this->send_estia_first_gen_zone1_mode(requested_mode);
         } else {
+          this->send_estia_first_gen_zone1_mode(requested_mode);
           // Issue #90: mode commands can be missed during Zone 1 startup.
           this->estia_first_gen_pending_zone1_mode_ = requested_mode;
           this->send_estia_first_gen_zone1(true);
@@ -4513,7 +4533,10 @@ void ToshibaAbClimate::process_received_data_estia_first_gen_(const DataFrame *f
     if (this->estia_first_gen_zone1_active_ && this->estia_first_gen_pending_zone1_mode_.has_value()) {
       const auto pending_mode = *this->estia_first_gen_pending_zone1_mode_;
       this->estia_first_gen_pending_zone1_mode_.reset();
-      this->send_estia_first_gen_zone1_mode(pending_mode);
+      // HEAT is already established by the captured 0x22:02:02 power-on frame.
+      // Sending 0x22:06:06 afterwards makes this hydrobox fall back to OFF/20.
+      if (pending_mode != climate::CLIMATE_MODE_HEAT)
+        this->send_estia_first_gen_zone1_mode(pending_mode);
     }
     this->estia_first_gen_dhw_active_ = frame->raw[6] & 0x02;
     this->estia_first_gen_dhw_boost_ = frame->raw[7] & 0x40;
